@@ -103,7 +103,6 @@ HELP
 	if ($log || $all == 1) {
 		print "Begin Log Grab.\n";
 		my $exec = "nohup /usr/sec/bin/grablogs --tarfile=$DSTDIR/$USERNAME.logs.tar --cususer=$USERNAME $domains_list\n";
-		print($exec);
 		$return_value    = eval { $cpanel->server->whm_exec($exec); };
 		print "A Problem occurred running grablog: $@\n Taking too long?\n" if $@;
 	}
