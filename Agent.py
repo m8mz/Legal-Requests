@@ -7,6 +7,9 @@ import os
 import time
 import getpass
 import platform
+import subprocess
+import re
+import json
 
 
 class Agent:
@@ -16,14 +19,23 @@ class Agent:
     """
 
     # Class Variables
-    bluehost, hostmonster, justhost = ['i.bluehost.com', 'i.hostmonster.com', 'i.justhost.com']
+    hosts = ['i.bluehost.com', 'i.justhost.com', 'i.hostmonster.com']
 
 
     def __init__(self, username=None):
+        """
+            Initiates the class and if no username is provided will check if it's WSL or Cygwin
+            to grab the username from the system.
+        """
+
         if username:
             self.username = username
         else:
             if platform.system() == 'Linux':
+                self.username = subprocess.check_output('/mnt/c/Windows/System32/cmd.exe /C "echo %USERNAME%"', shell=True).strip().decode('utf-8')
+            elif re.match(r'CYGWIN', platform.system()):
+                self.username = getpass.getuser()
+            else:
                 pass
                 
         self.cookie = "/tmp/agent_cookie.b"
@@ -39,7 +51,7 @@ class Agent:
             login request.
         """
 
-        login_link = "https://" + Agent.bluehost + "/cgi/admin/provider"
+        login_link = "https://" + Agent.hosts[0] + "/cgi/admin/provider"
         init_page = requests.get(login_link)
         args = {
             "admin_user": self.username,
@@ -112,9 +124,70 @@ class Agent:
             else:
                 args[key] = value
 
-        api_call = "https://" + Agent.bluehost + "/cgi/admin/hal/api/" + action
+        api_call = "https://" + Agent.hosts[0] + "/cgi/admin/hal/api/" + action
         r = requests.post(api_call, data=args, cookies=cookies)
         return r.json()
+
+
+    def db_request(self, sqlquery):
+        """
+            Send a request to the DB which returns a file of the JSON output.
+            Read file and return the JSON output.
+        """
+
+        cookies = self._load_cookie()
+        params = (
+            ("sql", sqlquery),
+        )
+        headers = {
+            'authority': 'i.bluehost.com',
+            'upgrade-insecure-requests': '1',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36',
+            'dnt': '1',
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3',
+            'accept-encoding': 'gzip, deflate, br',
+            'accept-language': 'en-US,en;q=0.9',
+        }
+
+        for host in Agent.hosts:
+            api_call = "https://" + host + "/cgi-bin/admin/db/jsonfile"
+            r = requests.get(api_call, headers=headers, params=params, cookies=cookies)
+            if r.headers.get('content-disposition'):
+                content = json.loads(r.content.decode('utf-8'))
+                if content.get('rows'):
+                    return (content['headers'], content['rows'])
+
+        return None
+
+
+    def cpm_request(self, cust_id, action):
+        """
+            Send a request to the CPM which returns a JSON response.
+        """
+
+        cookies = self._load_cookie()
+        params = (
+            ("json", action),
+            ("cust_id", cust_id)
+        )
+        headers = {
+            'authority': 'i.bluehost.com',
+            'upgrade-insecure-requests': '1',
+            'dnt': '1',
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3',
+            'accept-encoding': 'gzip, deflate, br',
+            'accept-language': 'en-US,en;q=0.9',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36'
+        }
+
+        for host in ['i.hostmonster.com']:
+            api_call = "https://" + host + "/cgi/admin/user/cpanel/"
+            r = requests.get(api_call, headers=headers, params=params, cookies=cookies)
+            if r.headers.get('Content-Type') == 'application/json': 
+                content = json.loads(r.content.decode('utf-8'))
+                print(content)
+                if not content.get('error') and content:
+                    return content
         
 
     def raise_error(self, error):
@@ -122,6 +195,7 @@ class Agent:
 
 
 if __name__ == "__main__":
-    user = Agent("mhancock-gaillard")
-    response = user.hal_request(action="whm_exec",server_id="27352",command="df -h")
-    print(response)
+    user = Agent()
+    #response = user.hal_request(action="whm_exec",server_id="27352",command="df -h")
+    #print(user.cpm_request('597965', "get_domains"))
+    print(user.db_request("select * from domain where domain = 'infinitedelusionpaintball.com'"))
