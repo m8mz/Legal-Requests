@@ -10,6 +10,21 @@ import platform
 import subprocess
 import re
 import json
+import sys
+
+
+class Agent_Error(Exception):
+    """
+        Custom error handling
+    """
+
+
+    def __init__(self, msg):
+        self.msg = msg
+
+
+    def __str__(self):
+        return self.msg
 
 
 class Agent:
@@ -36,9 +51,9 @@ class Agent:
             elif re.match(r'CYGWIN', platform.system()):
                 self.username = getpass.getuser()
             else:
-                pass
+                self.username = input("Username: ")
                 
-        self.cookie = "/tmp/agent_cookie.b"
+        self.cookies = ["/tmp/bluehost_cookie.data", "/tmp/justhost_cookie.data", "/tmp/hostmonster_cookie.data"]
         if not self.logged_in():
             password = getpass.getpass(prompt="Password: ")
             self.login(password)
@@ -51,44 +66,52 @@ class Agent:
             login request.
         """
 
-        login_link = "https://" + Agent.hosts[0] + "/cgi/admin/provider"
-        init_page = requests.get(login_link)
-        args = {
-            "admin_user": self.username,
-            "admin_pass": password
-        }
+        status = []
+        for num in range(3):
+            login_link = "https://" + Agent.hosts[num] + "/cgi/admin/provider"
+            init_page = requests.get(login_link)
+            args = {
+                "admin_user": self.username,
+                "admin_pass": password
+            }
 
-        parsed = BeautifulSoup(init_page.content, 'lxml')
-        hidden_values = parsed.find_all("input", type="hidden")
-        if len(hidden_values) == 4:
-            for v in hidden_values:
-                key = v.get('name')
-                val = v.get('value')
-                args[key] = val
-        
-        res = requests.post(login_link, data=args)
-        if res.status_code == 200 and 'Set-Cookie' in res.headers:
-            self._set_cookie(res.cookies)
+            parsed = BeautifulSoup(init_page.content, 'lxml')
+            hidden_values = parsed.find_all("input", type="hidden")
+            if len(hidden_values) == 4:
+                for v in hidden_values:
+                    key = v.get('name')
+                    val = v.get('value')
+                    args[key] = val
+            
+            res = requests.post(login_link, data=args)
+            if res.status_code == 200 and 'Set-Cookie' in res.headers:
+                self._set_cookie(res.cookies, num)
+                status.append(True)
+            else:
+                status.append(False)
+
+        if all(status):
             return True
         else:
-            return False
+            self.raise_error("Failed to login to {}, {}, {}".format(Agent.hosts))
+
             
 
-    def _set_cookie(self, cookies):
+    def _set_cookie(self, cookies, index):
         """
             Saves the created cookie to a binary cookie file for later usage.
         """
         
-        with open(self.cookie, 'wb') as file:
+        with open(self.cookies[index], 'wb') as file:
             pickle.dump(cookies, file)
 
 
-    def _load_cookie(self):
+    def _load_cookie(self, index):
         """
             Reads and return cookies from the binary cookie file.
         """
 
-        return pickle.load(open(self.cookie, 'rb'))
+        return pickle.load(open(self.cookies[index], 'rb'))
 
 
     def logged_in(self):
@@ -96,16 +119,17 @@ class Agent:
             Check for a valid cookie session.
         """
 
-        if not os.path.isfile(self.cookie):
+        if not all([os.path.isfile(cookie) for cookie in self.cookies]):
             return False
 
-        mtime_cookie = int(os.path.getmtime(self.cookie))
         current_time = int(time.time())
         expired_time = 60 * 60 * 9      # 9 hours
-        if current_time - mtime_cookie >= expired_time:
-            return False
-        else:
-            return True
+        for num in range(3):
+            mtime_cookie = int(os.path.getmtime(self.cookies[num]))
+            if current_time - mtime_cookie >= expired_time:
+                return False
+            else:
+                return True
 
 
     def hal_request(self, **kwargs):
@@ -114,7 +138,7 @@ class Agent:
             this function what API call to use.
         """
 
-        cookies = self._load_cookie()
+        cookies = self._load_cookie(0)
         args = {
             "_format": "json-api-text"
         }
@@ -126,7 +150,34 @@ class Agent:
 
         api_call = "https://" + Agent.hosts[0] + "/cgi/admin/hal/api/" + action
         r = requests.post(api_call, data=args, cookies=cookies)
-        return r.json()
+        json_output = r.json()
+        if json_output.get('success'):
+            return json_output['output']['return'].strip()
+        else:
+            return json_output
+
+
+    def get_pid_for_command(self, server_id, command):
+        """
+            Send a command through whm_exec HAL method and return the PID for
+            tracking/progress purposes. Hal API has a timeout which for long
+            running commands will be an issue. This is the work around.
+        """
+
+        query = f"nohup bash -c '{command}' & echo $!"
+        pid = self.hal_request(action="whm_exec", server_id=server_id, command=query)
+        return pid
+
+
+    def check_process(self, server_id, pid): # for hal_request
+        """
+            Check on a pid that was initiated from the hal_request method.
+            Will return True if still exists and False if it doesn't.
+        """
+
+        query = f"if ps p {pid} >/dev/null; then echo False; else echo True; fi"
+        response = self.hal_request(action="whm_exec", server_id=server_id, command=query)
+        return response
 
 
     def db_request(self, sqlquery):
@@ -135,7 +186,6 @@ class Agent:
             Read file and return the JSON output.
         """
 
-        cookies = self._load_cookie()
         params = (
             ("sql", sqlquery),
         )
@@ -149,12 +199,13 @@ class Agent:
             'accept-language': 'en-US,en;q=0.9',
         }
 
-        for host in Agent.hosts:
-            api_call = "https://" + host + "/cgi-bin/admin/db/jsonfile"
+        for num in range(3):
+            cookies = self._load_cookie(num)
+            api_call = "https://" + Agent.hosts[num] + "/cgi-bin/admin/db/jsonfile"
             r = requests.get(api_call, headers=headers, params=params, cookies=cookies)
             if r.headers.get('content-disposition'):
                 content = json.loads(r.content.decode('utf-8'))
-                if content.get('rows'):
+                if len(content) == 3:
                     return (content['headers'], content['rows'])
 
         return None
@@ -165,7 +216,6 @@ class Agent:
             Send a request to the CPM which returns a JSON response.
         """
 
-        cookies = self._load_cookie()
         params = (
             ("json", action),
             ("cust_id", cust_id)
@@ -180,22 +230,33 @@ class Agent:
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36'
         }
 
-        for host in ['i.hostmonster.com']:
-            api_call = "https://" + host + "/cgi/admin/user/cpanel/"
+        for num in range(3):
+            cookies = self._load_cookie(num)
+            api_call = "https://" + Agent.hosts[num] + "/cgi/admin/user/cpanel/"
             r = requests.get(api_call, headers=headers, params=params, cookies=cookies)
             if r.headers.get('Content-Type') == 'application/json': 
                 content = json.loads(r.content.decode('utf-8'))
-                print(content)
                 if not content.get('error') and content:
                     return content
         
 
     def raise_error(self, error):
-        pass
+        try:
+            raise(Agent_Error(error))
+        except Agent_Error as err:
+            print('Error: {}'.format(err))
+            sys.exit()
 
 
 if __name__ == "__main__":
     user = Agent()
-    #response = user.hal_request(action="whm_exec",server_id="27352",command="df -h")
-    #print(user.cpm_request('597965', "get_domains"))
-    print(user.db_request("select * from domain where domain = 'infinitedelusionpaintball.com'"))
+    #pid = user.get_pid_for_command("27352", "sleep 5")
+    #print(pid)
+    #print(user.check_process(27352, pid))
+    #print(user.hal_request(action="whm_exec",server_id="27352",command="df -h"))
+    #time.sleep(8)
+    #print(user.check_process(27352, pid))
+    #print(user.cpm_request('1383314', "get_domains"))
+    #print(user.db_request("select * from domain where domain = 'infinitedelusionpaintball.com'"))
+    #print(user.db_request("select * from domain where domain = 'bluehostproservices.com'"))
+    #print(user.db_request("select * from domain where domain = 'janellektra.net'"))
