@@ -6,6 +6,7 @@ import sys
 import string
 from jumpssh import SSHSession
 from datetime import datetime
+import re
 
 
 def grabLogs(tarfile, username, domains):
@@ -60,13 +61,16 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
     domains = [domain.get('domain') for domain in domains_query]
     today_date = datetime.now().strftime("%Y-%m-%d")
     custbox = agent.hal_request(action="server_info", id=server_id).get('hostname')
+    custhome = agent.hal_request(action="whm_exec", server_id=server_id, command="getent passwd {} | cut -d: -f6".format(username))
+    custnum = re.match(r'/home(\d+)/', custhome).group(1)
 
-    if server_id and username and custbox:
+    if server_id and username and custbox and custhome:
         # SSH Sessions
         gateway_session = SSHSession('zugzug2.bluehost.com', port=5190, username=agent.username)
         legal_session = gateway_session.get_remote_session('10.0.82.205')
 
-        cust_disk_size = agent.hal_request(action="whm_exec", server_id=server_id, command="du -sh /home/{}/".format(username))
+        cust_disk_size = int(re.match(r'^(\d+)', agent.hal_request(action="whm_exec", server_id=server_id, command="du -sh {}".format(custhome))).group(1))
+        overall_size_est = cust_disk_size * 4
         disk_results = agent.hal_request(action="whm_exec", server_id=server_id, command="df -h | awk '$6 ~ /home/{print $6\":\"$5\":\"$4}'").split('\n')
         home_disks = []
         for disk in disk_results:
@@ -80,9 +84,18 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         home_disks.sort(key = lambda x: x[2], reverse = True)
         for disk in home_disks:
             path, usage, avail = disk
-            if avail >= 30:
+            if avail > overall_size_est:
                 home_disk = path
                 break
+        try:
+            home_disk
+        except NameError:
+            #TODO: Do the preservation in sections
+            print("No home disk that can support ~{}G".format(overall_size_est))
+            sys.exit()
+        else:
+            pass
+
         print("Initiating Legal Request...")
         print()
         print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -103,6 +116,20 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
             grabLogs(tarfile, username, domains)
         else:
             print("Processing request for full preservation and logs.. please wait.")
+            grabLogs(tarfile, username, domains)
+            dir_command = f"mkdir -p {box_dir}/non-home-data"
+            print(dir_command)
+            #agent.hal_request(action="whm_exec", server_id=server_id, command=dir_command)
+            #pkgacct_pid = agent.get_pid_for_command(action="whm_exec", server_id=server_id, command=command)
+            box_command_list = [
+                f"/scripts/pkgacct --skiphomedir --skiplogs {username} {box_dir}/non-home-data",
+            ]
+            legal_command_list = [
+                f"rsync -x -rlpt --chown={agent.username}:wheel {custbox}:{custhome}/ {legal_dir}/{username}.home/ 2> ./rsync-err.log",
+                f"rsync -x -rlpt --chown={agent.username}:wheel --exclude=homedir {custbox}:/backup{custnum}/cpbackup/seed/{username}/ {legal_dir}/{username}.seed/",
+                f"rsync -x -rlpt --chown={agent.username}:wheel --link-dest={legal_dir}/{username}.home {custbox}:/backup{custnum}/cpbackup/seed/{username}/{homedir}/ {legal_dir}/{username}.seed/homedir/",
+            ]
+
 
 
 
