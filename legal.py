@@ -9,20 +9,6 @@ from datetime import datetime
 import re
 
 
-def grabLogs(tarfile, username, domains):
-    global server_id
-    global agent
-    command = 'if [[ -f "/usr/sec/bin/grablogs" ]]; then echo True; else echo False; fi'
-    if agent.hal_request(action="whm_exec", server_id=server_id, command=command):
-        domains_list = "--domains={}".format(" --domains=".join(domains))
-        command = f"/usr/sec/bin/grablogs --tarfile={tarfile} --cususer={username} {domains_list}"
-        print(command)
-        # log_pid = agent.get_pid_for_command(server_id, command=command)
-    else:
-        print("The grablogs Perl script does not exist. Must fix this first.")
-        sys.exit()
-
-
 agent = Agent()
 
 parser = argparse.ArgumentParser()
@@ -102,6 +88,10 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         except NameError:
             #TODO: Do the preservation in sections
             print("No home disk that can support ~{}G".format(overall_size_est))
+            usable_disks = [disk for disk in home_disks if disk[2] > cust_disk_size]
+            if usable_disks:
+                print("has available disks to perform these tasks individually")
+                print(usable_disks)
             sys.exit()
         else:
             pass
@@ -118,33 +108,38 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         # Legal Server Prep
         legal_dir = "/legal2/{}/{}".format(args.domain, today_date)
         box_dir = "{}/sd/{}".format(home_disk, username)
-
+        pid_list = []
         legal_session.run_cmd(f"mkdir -p {legal_dir}")
         tarfile = "{}/{}.logs.tar".format(box_dir, username)
-        if args.logs:
-            print("Processing request for logs.. please wait.")
-            grabLogs(tarfile, username, domains)
+        grablogs_exist = 'if [[ -f "/usr/sec/bin/grablogs" ]]; then echo True; else echo False; fi'
+        if agent.hal_request(action="whm_exec", server_id=server_id, command=grablogs_exist):
+            domains_list = "--domains={}".format(" --domains=".join(domains))
+            command = f"/usr/sec/bin/grablogs --tarfile={tarfile} --cususer={username} {domains_list}"
+            print(command)
+            # log_pid = agent.get_pid_for_command(server_id, command=command)
+            # pid_list.append(log_pid)
         else:
+            print("The grablogs Perl script does not exist. Must fix this first.")
+            sys.exit()
+            
+        
+        if not args.logs:
             print("Processing request for full preservation and logs.. please wait.")
-            grabLogs(tarfile, username, domains)
-            dir_command = f"mkdir -p {box_dir}/non-home-data"
-            print(dir_command)
-            #agent.hal_request(action="whm_exec", server_id=server_id, command=dir_command)
-            #pkgacct_pid = agent.get_pid_for_command(action="whm_exec", server_id=server_id, command=command)
             box_command_list = [
-                f"/scripts/pkgacct --skiphomedir --skiplogs {username} {box_dir}/non-home-data",
+                f"mkdir -p {box_dir}/non-home-data {box_dir}/{username}.seed {box_dir}/{username}.seed/homedir",
+                f"/scripts/pkgacct --skiphomedir --skiplogs {username} {box_dir}/non-home-data 2>&1",
+                f"cp --preserve=links -xpr {custhome} {box_dir}/{username}.home",
+                f"rsync -x -rlptgo --exclude=homedir /backup{custnum}/cpbackup/seed/{username}/ {box_dir}/{username}.seed",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.home /backup{custnum}/cpbackup/seed/{username}/homedir/ {box_dir}/{username}.seed/homedir/",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/daily/{username}/ {box_dir}/{username}.daily",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/weekly/{username}/ {box_dir}/{username}.weekly",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/monthly/{username}/ {box_dir}/{username}.monthly",
+                f"chown -R {agent.username} {box_dir}",
+                "find " + box_dir + " -xdev -type d ! -perm -500 -exec chmod u+rx {} \;",
+                "find " + box_dir + " -xdev -type f ! -perm -400 -exec chmod u+r {} \;"
             ]
-            legal_command_list = (
-
-            )
-            legal_command_list = [
-                f"rsync -x -rlpt --chown={agent.username}:wheel {custbox}:{custhome}/ {legal_dir}/{username}.home/ 2> ./rsync-err.log",
-                f"rsync -x -rlpt --chown={agent.username}:wheel --exclude=homedir {custbox}:/backup{custnum}/cpbackup/seed/{username}/ {legal_dir}/{username}.seed/",
-                f"rsync -x -rlpt --chown={agent.username}:wheel --link-dest={legal_dir}/{username}.home {custbox}:/backup{custnum}/cpbackup/seed/{username}/{homedir}/ {legal_dir}/{username}.seed/homedir/",
-            ]
-
-
-
+        else:
+            print("Processing request for logs.. please wait.")
 
     else:
         print("No server id/username was found from the account information in HAL. Exiting...")
