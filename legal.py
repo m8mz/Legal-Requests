@@ -7,6 +7,7 @@ import string
 from jumpssh import SSHSession
 from datetime import datetime
 import re
+import time
 
 
 agent = Agent()
@@ -59,9 +60,6 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
     custnum = re.match(r'/home(\d+)/', custhome).group(1)
 
     if server_id and username and custbox and custhome:
-        # SSH Sessions
-        gateway_session = SSHSession('zugzug2.bluehost.com', port=5190, username=agent.username)
-        legal_session = gateway_session.get_remote_session('10.0.82.205')
 
         cust_disk_size = int(re.match(r'^(\d+)', agent.hal_request(action="whm_exec", server_id=server_id,
                                                                    command="du -sh {}".format(custhome))).group(1))
@@ -92,6 +90,7 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
             if usable_disks:
                 print("has available disks to perform these tasks individually")
                 print(usable_disks)
+                max_queue = len(usable_disks)
             sys.exit()
         else:
             pass
@@ -105,19 +104,32 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         print("Requested Domain: {}".format(args.domain))
         print()
 
-        # Legal Server Prep
-        legal_dir = "/legal2/{}/{}".format(args.domain, today_date)
+        # Customer Box Prep
         box_dir = "{}/sd/{}".format(home_disk, username)
-        pid_list = []
-        legal_session.run_cmd(f"mkdir -p {legal_dir}")
         tarfile = "{}/{}.logs.tar".format(box_dir, username)
+        active_queue = []
+        waiting_queue = [
+                f"/scripts/pkgacct --skiphomedir --skiplogs {username} {box_dir}/non-home-data 2>&1",
+                f"rsync -azx {custhome} {box_dir}/{username}.home",
+                f"rsync -x -rlptgo --exclude=homedir /backup{custnum}/cpbackup/seed/{username}/ {box_dir}/{username}.seed",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.home /backup{custnum}/cpbackup/seed/{username}/homedir/ {box_dir}/{username}.seed/homedir/",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/daily/{username}/ {box_dir}/{username}.daily",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/weekly/{username}/ {box_dir}/{username}.weekly",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/monthly/{username}/ {box_dir}/{username}.monthly"
+        ]
+        cleanup_queue = [
+                f"chown -R {agent.username} {box_dir}",
+                "find " + box_dir + " -xdev -type d ! -perm -500 -exec chmod u+rx {} \;",
+                "find " + box_dir + " -xdev -type f ! -perm -400 -exec chmod u+r {} \;"
+        ]
+        
         grablogs_exist = 'if [[ -f "/usr/sec/bin/grablogs" ]]; then echo True; else echo False; fi'
         if agent.hal_request(action="whm_exec", server_id=server_id, command=grablogs_exist):
             domains_list = "--domains={}".format(" --domains=".join(domains))
             command = f"/usr/sec/bin/grablogs --tarfile={tarfile} --cususer={username} {domains_list}"
             print(command)
-            # log_pid = agent.get_pid_for_command(server_id, command=command)
-            # pid_list.append(log_pid)
+            # log_pid = agent.get_pid_for_command(server_id, command)
+            # active_queue.append(log_pid)
         else:
             print("The grablogs Perl script does not exist. Must fix this first.")
             sys.exit()
@@ -125,21 +137,60 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         
         if not args.logs:
             print("Processing request for full preservation and logs.. please wait.")
-            box_command_list = [
-                f"mkdir -p {box_dir}/non-home-data {box_dir}/{username}.seed {box_dir}/{username}.seed/homedir",
-                f"/scripts/pkgacct --skiphomedir --skiplogs {username} {box_dir}/non-home-data 2>&1",
-                f"cp --preserve=links -xpr {custhome} {box_dir}/{username}.home",
-                f"rsync -x -rlptgo --exclude=homedir /backup{custnum}/cpbackup/seed/{username}/ {box_dir}/{username}.seed",
-                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.home /backup{custnum}/cpbackup/seed/{username}/homedir/ {box_dir}/{username}.seed/homedir/",
-                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/daily/{username}/ {box_dir}/{username}.daily",
-                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/weekly/{username}/ {box_dir}/{username}.weekly",
-                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/monthly/{username}/ {box_dir}/{username}.monthly",
-                f"chown -R {agent.username} {box_dir}",
-                "find " + box_dir + " -xdev -type d ! -perm -500 -exec chmod u+rx {} \;",
-                "find " + box_dir + " -xdev -type f ! -perm -400 -exec chmod u+r {} \;"
-            ]
+            setup_command = f"mkdir -p {box_dir}/non-home-data {box_dir}/{username}.seed {box_dir}/{username}.seed/homedir"
+            agent.hal_request(action="whm_exec", server_id=server_id, command=setup_command)
+            for item in waiting_queue:
+                print(item)
+                #active_queue.append(agent.get_pid_for_command(server_id, item))
+
         else:
             print("Processing request for logs.. please wait.")
+            
+        counter = 0
+        while True:
+            if all(
+                not agent.check_process(pid)
+                for pid in active_queue
+            ):
+                print("All processes running on the customer's box have finished.")
+                break
+            else:
+                counter += 1
+                if counter < 5:
+                    time.sleep(30)
+                elif counter < 15:
+                    time.sleep(90)
+                else:
+                    time.sleep(300)
+                    
+        print("Fixing permissions and ownership of data..")
+        for item in cleanup_queue:
+            agent.hal_request(action="whm_exec", server_id=server_id, command=item)
+        
+        
+        print("Starting the process of migrating the data to the legal server..")
+        legal_addr = '10.0.82.205'
+        legal_dir = "/legal2/{}/{}".format(args.domain, today_date)
+        gateway_session = SSHSession('zugzug2.bluehost.com', port=5190, username=agent.username)
+        legal_session = gateway_session.get_remote_session(legal_addr)
+        legal_session.run_cmd(f"mkdir -p {legal_dir}")
+        
+        if not bluerock:
+            legal_session.run_cmd(f"rsync -rlptgoH {custbox}:{box_dir}/* {legal_dir}/ 2> ./rsync-err.log")
+        else:
+            pass
+        
+        print("Finished migrating the data.")
+        print("Updating group to 'wheel' recursively..")
+        legal_session.run_cmd(f"chgrp -R wheel {legal_dir}/*")
+        print("Calculating size..")
+        legal_size = legal_session.run_cmd(f"du -sh {legal_dir}").output.split('\t')[0]
+        print("Done.")
+        print()
+        print("Location: {}".format(legal_dir))
+        print("Size: {}".format(legal_size))
+        print()
+        
 
     else:
         print("No server id/username was found from the account information in HAL. Exiting...")

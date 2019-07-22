@@ -11,6 +11,7 @@ import subprocess
 import re
 import json
 import sys
+import distutils.util
 
 
 class Agent_Error(Exception):
@@ -177,7 +178,7 @@ class Agent:
 
         query = f"if ps p {pid} >/dev/null; then echo False; else echo True; fi"
         response = self.hal_request(action="whm_exec", server_id=server_id, command=query)
-        return response
+        return bool(distutils.util.strtobool(response))
 
 
     def db_request(self, sqlquery):
