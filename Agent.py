@@ -152,7 +152,7 @@ class Agent:
         api_call = "https://" + Agent.hosts[0] + "/cgi/admin/hal/api/" + action
         r = requests.post(api_call, data=args, cookies=cookies)
         json_output = r.json()
-        if json_output.get('success'):
+        if json_output.get('success') and json_output['output']['return'] is not None:
             return json_output['output']['return'].strip()
         else:
             return json_output

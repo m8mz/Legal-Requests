@@ -10,6 +10,15 @@ import re
 import time
 
 
+def convert_to_gigs(x):
+    if 'T' in x:
+        x = "".join(c for c in x if c in string.digits)
+        x = int(avail + "000")
+    else:
+        x = int(float(x.replace('G', '')))
+    return x
+
+
 agent = Agent()
 
 parser = argparse.ArgumentParser()
@@ -30,15 +39,6 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
     if account_type == "vps" or account_type == "dedicated":
         print("This is a VPS/Dedicated server. Exiting...")
         sys.exit()
-    query = (
-    "SELECT customer_meta_name.name FROM domain "
-    "INNER JOIN cpanel ON domain.account_id = cpanel.custid "
-    "INNER JOIN customer_meta ON cpanel.custid = customer_meta.cust_id "
-    "INNER JOIN customer_meta_name ON customer_meta.name_id = customer_meta_name.id "
-    "WHERE domain = '{}' "
-    "AND customer_meta_name.name = 'bluerock'"
-    ).format(args.domain)
-    bluerock = agent.db_request(query)
 
     if res[1][0].get('hal_server_id'): 
         server_id = res[1][0].get('hal_server_id')
@@ -69,11 +69,7 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         home_disks = []
         for disk in disk_results:
             path, usage, avail = disk.split(':')
-            if 'T' in avail:
-                avail = "".join(c for c in avail if c in string.digits)
-                avail = int(avail + "000")
-            else:
-                avail = int(float(avail.replace('G', '')))
+            avail = convert_to_gigs(avail)
             home_disks.append((path, usage, avail))
         home_disks.sort(key=lambda x: x[2], reverse=True)
         for disk in home_disks:
@@ -110,12 +106,12 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         active_queue = []
         waiting_queue = [
                 f"/scripts/pkgacct --skiphomedir --skiplogs {username} {box_dir}/non-home-data 2>&1",
-                f"rsync -azx {custhome} {box_dir}/{username}.home",
-                f"rsync -x -rlptgo --exclude=homedir /backup{custnum}/cpbackup/seed/{username}/ {box_dir}/{username}.seed",
+                f"rsync -azx {custhome}/ {box_dir}/{username}.home",
+                f"rsync -x -rlptgo --exclude=homedir /backup{custnum}/cpbackup/seed/{username}/ {box_dir}/{username}.seed/",
                 f"rsync -x -rlptgo --link-dest={box_dir}/{username}.home /backup{custnum}/cpbackup/seed/{username}/homedir/ {box_dir}/{username}.seed/homedir/",
-                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/daily/{username}/ {box_dir}/{username}.daily",
-                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/weekly/{username}/ {box_dir}/{username}.weekly",
-                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/monthly/{username}/ {box_dir}/{username}.monthly"
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/daily/{username}/ {box_dir}/{username}.daily/",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/weekly/{username}/ {box_dir}/{username}.weekly/",
+                f"rsync -x -rlptgo --link-dest={box_dir}/{username}.seed /backup{custnum}/cpbackup/monthly/{username}/ {box_dir}/{username}.monthly/"
         ]
         cleanup_queue = [
                 f"chown -R {agent.username} {box_dir}",
@@ -127,35 +123,34 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         if agent.hal_request(action="whm_exec", server_id=server_id, command=grablogs_exist):
             domains_list = "--domains={}".format(" --domains=".join(domains))
             command = f"/usr/sec/bin/grablogs --tarfile={tarfile} --cususer={username} {domains_list}"
-            print(command)
-            # log_pid = agent.get_pid_for_command(server_id, command)
-            # active_queue.append(log_pid)
+            log_pid = agent.get_pid_for_command(server_id, command)
+            active_queue.append(log_pid)
         else:
             print("The grablogs Perl script does not exist. Must fix this first.")
             sys.exit()
             
         
         if not args.logs:
-            print("Processing request for full preservation and logs.. please wait.")
+            print("Processing request for full preservation and logs.. please wait.", end='')
             setup_command = f"mkdir -p {box_dir}/non-home-data {box_dir}/{username}.seed {box_dir}/{username}.seed/homedir"
             agent.hal_request(action="whm_exec", server_id=server_id, command=setup_command)
             for item in waiting_queue:
-                print(item)
-                #active_queue.append(agent.get_pid_for_command(server_id, item))
+                active_queue.append(agent.get_pid_for_command(server_id, item))
 
         else:
-            print("Processing request for logs.. please wait.")
+            print("Processing request for logs.. please wait.", end='')
             
         counter = 0
         while True:
             if all(
-                not agent.check_process(pid)
+                not agent.check_process(server_id, pid)
                 for pid in active_queue
             ):
-                print("All processes running on the customer's box have finished.")
+                print("\nAll processes running on the customer's box have finished.")
                 break
             else:
                 counter += 1
+                print('.', end='')
                 if counter < 5:
                     time.sleep(30)
                 elif counter < 15:
@@ -175,10 +170,40 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         legal_session = gateway_session.get_remote_session(legal_addr)
         legal_session.run_cmd(f"mkdir -p {legal_dir}")
         
+        legal2_size = legal_session.run_cmd("df -h | awk '$6 ~ /legal2/{print $4}'").output.split('\t')[0]
+        legal2_size = convert_to_gigs(legal2_size)
+        if legal2_size < overall_size_est:
+            print("Err: Not enough space available on the legal server '/legal2' need ~{}".format(overall_size_est))
+            print("Exiting..")
+            sys.exit()
+        
+        query = (
+        "SELECT customer_meta_name.name FROM domain "
+        "INNER JOIN cpanel ON domain.account_id = cpanel.custid "
+        "INNER JOIN customer_meta ON cpanel.custid = customer_meta.cust_id "
+        "INNER JOIN customer_meta_name ON customer_meta.name_id = customer_meta_name.id "
+        "WHERE domain = '{}' "
+        "AND customer_meta_name.name = 'bluerock'"
+        ).format(args.domain)
+        bluerock = agent.db_request(query)
         if not bluerock:
-            legal_session.run_cmd(f"rsync -rlptgoH {custbox}:{box_dir}/* {legal_dir}/ 2> ./rsync-err.log")
+            print("Data currently being migrated..")
+            legal_session.run_cmd(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -rlptgoH {custbox}:{box_dir}/* {legal_dir}/ 2> ./rsync-err.log")
         else:
-            pass
+            custbox_var = agent.hal_request(action="whm_exec", server_id=server_id, command="df -h | awk '$6 ~ /var$/{print $6\":\"$5\":\"$4}'")
+            custbox_var_size = custbox_var.split(':')[2]
+            custbox_var_size = convert_to_gigs(custbox_var_size)
+            
+            custbox_sd_size = int(re.match(r'^(\d+)', agent.hal_request(action="whm_exec", server_id=server_id,
+                                                                   command=f"du -sh {box_dir}")).group(1))
+            if custbox_var_size > custbox_sd_size:
+                pass
+            else:
+                print("Issue: Not enough space on /var to hold the tar file")
+                print("Migrate this manually to the legal server.")
+                print("Legal Dir: {}".format(legal_dir))
+            
+            
         
         print("Finished migrating the data.")
         print("Updating group to 'wheel' recursively..")
