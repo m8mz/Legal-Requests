@@ -148,9 +148,13 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
             else:
                 agent.whm_exec(server_id, f"rsync -x -a {custhome}/logs {box_dir}/")
         else:
-            print("The grablogs Perl script does not exist. Must fix this first.")
-            sys.exit()
-            
+            print("Installing grablogs to server..")
+            agent.whm_exec(server_id, "mkdir -p /usr/sec/bin/")
+            if bluerock:
+                agent.whm_exec(server_id, "wget -O /usr/sec/bin/grablogs https://raw.githubusercontent.com/marcushg36/Legal-Requests/master/grablogs_bluerock.pl && chmod 700 /usr/sec/bin/grablogs")
+            else:
+                agent.whm_exec(server_id, "wget -O /usr/sec/bin/grablogs https://raw.githubusercontent.com/marcushg36/Legal-Requests/master/grablogs.pl && chmod 700 /usr/sec/bin/grablogs")
+            print("Done.")
         
         if not args.logs:
             print("Processing request for full preservation and logs.. please wait.")
