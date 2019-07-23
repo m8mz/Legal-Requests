@@ -19,8 +19,8 @@ def convertToGigs(x):
     return x
 
 
-def userConfirm():
-    print("Please do so manually..")
+def userConfirm(msg="Please do so manually.."):
+    print(msg)
     try:
         input("Press Enter to continue...")
     except (KeyboardInterrupt, SystemExit):
@@ -255,11 +255,7 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
                 print("https://confluence.endurance.com/pages/viewpage.action?pageId=111327316")
                 print("Legal Dir: {}".format(legal_dir))
                 print()
-                print("Waiting for manual migration")
-                try:
-                    input("Press Enter to continue...")
-                except (KeyboardInterrupt, SystemExit):
-                    print("Exiting...")
+                userConfirm("Waiting for manual migration..")
         
         print("Finished migrating the data.")
         print("Updating group to 'wheel' recursively..")
