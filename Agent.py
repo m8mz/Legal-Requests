@@ -152,10 +152,21 @@ class Agent:
         api_call = "https://" + Agent.hosts[0] + "/cgi/admin/hal/api/" + action
         r = requests.post(api_call, data=args, cookies=cookies)
         json_output = r.json()
-        if json_output.get('success') and json_output['output']['return'] is not None:
-            return json_output['output']['return'].strip()
+        return json_output
+        
+        
+    def whm_exec(self, server_id, command, output=False):
+        """
+            Send a command through whm_exec HAL method.
+        """
+        if not output:
+            command = f"nohup bash -c '{command}' &"
+            
+        response = self.hal_request(action="whm_exec", server_id=server_id, command=command)
+        if response.get('success') and response['output']['return'] is not None:
+            return response['output']['return'].strip() if output else True
         else:
-            return json_output
+            return False
 
 
     def get_pid_for_command(self, server_id, command):
