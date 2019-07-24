@@ -28,7 +28,12 @@ def userConfirm(msg="Please do so manually.."):
         sys.exit()
 
 
+DIVIDE_MIGRATION = False
+
 agent = Agent()
+
+gateway_session = SSHSession('zugzug2.bluehost.com', port=5190, username=agent.username)
+legal_session = gateway_session.get_remote_session(legal_addr)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("domain", help="main domain for the cpanel account")
@@ -101,12 +106,14 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         except NameError:
             #TODO: Do the preservation in sections
             print("Err: No home disk that can support ~{}G".format(overall_size_est))
-            usable_disks = [disk for disk in home_disks if disk[2] > cust_disk_size]
+            usable_disks = [disk[0] for disk in home_disks if disk[2] > cust_disk_size + 5]
             if usable_disks:
-                print("has available disks to perform these tasks individually")
+                print("Going to migrate the data separately. Will take longer..")
                 print(usable_disks)
-                max_queue = len(usable_disks) # var used for max concurrent processes
-            sys.exit()
+                home_disk = usable_disks[0]
+                DIVIDE_MIGRATION = True
+            else:
+                sys.exit()
         else:
             pass
 
@@ -154,106 +161,106 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         command = f"/usr/sec/bin/grablogs --tarfile={tarfile} --cususer={username} {domains_list}"
         agent.whm_exec(server_id, command)
         if bluerock:
-            agent.whm_exec(server_id, f"rsync -x -a /home/apachelogs/{username}/ {box_dir}/logs/")
-            agent.whm_exec(server_id, f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{args.domain}* {box_dir}/logs/")
+            waiting_queue.append(f"rsync -x -a /home/apachelogs/{username}/ {box_dir}/logs/")
+            waiting_queue.append(f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{args.domain}* {box_dir}/logs/")
         else:
-            agent.whm_exec(server_id, f"rsync -x -a {custhome}/logs {box_dir}/")
+            waiting_queue.append(f"rsync -x -a {custhome}/logs {box_dir}/")
         
         if not args.logs:
             print("Processing request for full preservation and logs.. please wait.")
             setup_command = f"mkdir -p {box_dir}/non-home-data {box_dir}/{username}.seed {box_dir}/{username}.seed/homedir"
             agent.whm_exec(server_id, setup_command)
-            for item in waiting_queue:
-                agent.whm_exec(server_id, item)
-                time.sleep(3)
+            
+            if not DIVIDE_MIGRATION:
+                for item in waiting_queue:
+                    agent.whm_exec(server_id, item)
+                    time.sleep(3)
+            elif DIVIDE_MIGRATION and bluerock:
+                pass
+            elif DIVIDE_MIGRATION and not bluerock:
+                pass
+                
 
         else:
             print("Processing request for logs.. please wait.")
         
+        
+        if not DIVIDE_MIGRATION:
+            counter = 0
+            while True:
+                getpid_command = "ps faux | grep " + username + "| awk '/" + box_dir.replace('/','\/') + "/{print $2}'"
+                processes = agent.whm_exec(server_id, getpid_command, output=True)
+                if processes:
+                    active_queue = processes.split('\n')
+                else:
+                    break
+                
+                counter += 1
+                print('.', end='', flush=True)
+                if counter < 5:
+                    time.sleep(30)
+                elif counter < 15:
+                    time.sleep(60)
+                else:
+                    time.sleep(90)
+            print("Done.")
+                        
+            print("Fixing permissions and ownership of data..")
+            for item in cleanup_queue:
+                agent.whm_exec(server_id, item)
             
-        counter = 0
-        while True:
-            getpid_command = "ps faux | grep " + username + "| awk '/" + box_dir.replace('/','\/') + "/{print $2}'"
-            processes = agent.whm_exec(server_id, getpid_command, output=True)
-            if processes:
-                active_queue = processes.split('\n')
-            else:
-                break
             
-            counter += 1
-            print('.', end='', flush=True)
-            if counter < 5:
-                time.sleep(30)
-            elif counter < 15:
-                time.sleep(60)
-            else:
-                time.sleep(90)
-        print("Done.")
-                    
-        print("Fixing permissions and ownership of data..")
-        for item in cleanup_queue:
-            agent.whm_exec(server_id, item)
-        
-        
-        print("Starting the process of migrating the data to the legal server..")
-        custbox_addr = agent.whm_exec(server_id, "hostname -i", output=True)
-        legal_addr = '10.0.82.205'
-        legal_dir = "/legal2/{}/{}".format(args.domain, today_date)
-        gateway_session = SSHSession('zugzug2.bluehost.com', port=5190, username=agent.username)
-        legal_session = gateway_session.get_remote_session(legal_addr)
-        legal_session.run_cmd(f"mkdir -p {legal_dir}")
-        
-        legal2_size = legal_session.run_cmd("df -h | awk '$6 ~ /legal2/{print $4}'").output.split('\t')[0]
-        legal2_size = convertToGigs(legal2_size)
-        if legal2_size < overall_size_est:
-            print("Err: Not enough space available on the legal server '/legal2' need ~{}".format(overall_size_est))
-            print("Exiting..")
-            sys.exit()
-        
-        if not bluerock:
-            print("Data currently being migrated..")
-            legal_session.run_cmd(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -rlptgoH {custbox}:{box_dir}/* {legal_dir}/ 2> ./rsync-err.log")
-        else:
-            custbox_var = agent.whm_exec(server_id, "df -h | awk '$6 ~ /var$/{print $6\":\"$5\":\"$4}'",
-                                         output=True)
-            custbox_var_size = custbox_var.split(':')[2]
-            custbox_var_size = convertToGigs(custbox_var_size)
+            print("Starting the process of migrating the data to the legal server..")
             
-            custbox_sd_size = int(re.match(r'^(\d+)', agent.whm_exec(server_id,
-                                           f"du -sh {box_dir}",
-                                           output=True)).group(1))
-            if custbox_var_size > custbox_sd_size:
-                print("Creating compressed file for transfer..")
-                html_var = "/var/www/html"
-                agent.whm_exec(server_id, f"cd {box_dir} && tar -caf {html_var}/{username}.tgz *")
-                while True:
-                    print('.', end='', flush=True)
-                    tar_pid = agent.whm_exec(server_id, f"ps faux | grep '{username}.tgz' | grep -v grep | awk '{{print $2}}'",
-                                             output=True)
-                    if not tar_pid:
-                        break
-                    time.sleep(10)
-                print('Done.')
-                agent.whm_exec(server_id, f"""sed -i "s,RewriteRule !^index.cgi|,RewriteRule !^{username}.tgz|index.cgi|," {html_var}/.htaccess""")
+            if legal2_size < overall_size_est:
+                print("Err: Not enough space available on the legal server '/legal2' need ~{}".format(overall_size_est))
+                print("Exiting..")
+                sys.exit()
+            
+            if not bluerock:
                 print("Data currently being migrated..")
-                try:
-                    gateway_session.run_cmd(f"wget {custbox_addr}/{username}.tgz")
-                except exception.RunCmdError:
-                    print(f"Issue updating {html_var}/.htaccess to allow the compressed file '{html_var}/{username}.tgz' in the RewriteRule.")
-                    sys.exit()
-                gateway_session.run_cmd(f"scp {username}.tgz {legal_addr}:{legal_dir}/")
-                legal_session.run_cmd(f"cd {legal_dir} && tar -xf {username}.tgz")
-                print("Cleaning up bluerock migration..")
-                agent.whm_exec(server_id, f"""sed -i "s,RewriteRule !^{username}.tgz|index.cgi|,RewriteRule !^index.cgi|," {html_var}/.htaccess""")
-                agent.whm_exec(server_id, f"rm -f {html_var}/{username}.tgz")
-                gateway_session.run_cmd(f"rm -f {username}.tgz")
+                legal_session.run_cmd(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -rlptgoH {custbox}:{box_dir}/* {legal_dir}/ 2> ./rsync-err.log")
             else:
-                print("Issue: Not enough space on /var to hold the tar file")
-                print("Migrate this manually to the legal server.")
-                print("https://confluence.endurance.com/pages/viewpage.action?pageId=111327316")
-                print("Legal Dir: {}".format(legal_dir))
-                print()
-                userConfirm("Waiting for manual migration..")
+                custbox_var = agent.whm_exec(server_id, "df -h | awk '$6 ~ /var$/{print $6\":\"$5\":\"$4}'",
+                                             output=True)
+                custbox_var_size = custbox_var.split(':')[2]
+                custbox_var_size = convertToGigs(custbox_var_size)
+                
+                custbox_sd_size = int(re.match(r'^(\d+)', agent.whm_exec(server_id,
+                                               f"du -sh {box_dir}",
+                                               output=True)).group(1))
+                if custbox_var_size > custbox_sd_size:
+                    print("Creating compressed file for transfer..")
+                    html_var = "/var/www/html"
+                    agent.whm_exec(server_id, f"cd {box_dir} && tar -caf {html_var}/{username}.tgz *")
+                    while True:
+                        print('.', end='', flush=True)
+                        tar_pid = agent.whm_exec(server_id, f"ps faux | grep '{username}.tgz' | grep -v grep | awk '{{print $2}}'",
+                                                 output=True)
+                        if not tar_pid:
+                            break
+                        time.sleep(10)
+                    print('Done.')
+                    agent.whm_exec(server_id, f"""sed -i "s,RewriteRule !^index.cgi|,RewriteRule !^{username}.tgz|index.cgi|," {html_var}/.htaccess""")
+                    print("Data currently being migrated..")
+                    try:
+                        gateway_session.run_cmd(f"wget {custbox_addr}/{username}.tgz")
+                    except exception.RunCmdError:
+                        print(f"Issue updating {html_var}/.htaccess to allow the compressed file '{html_var}/{username}.tgz' in the RewriteRule.")
+                        sys.exit()
+                    gateway_session.run_cmd(f"scp {username}.tgz {legal_addr}:{legal_dir}/")
+                    legal_session.run_cmd(f"cd {legal_dir} && tar -xf {username}.tgz")
+                    print("Cleaning up bluerock migration..")
+                    agent.whm_exec(server_id, f"""sed -i "s,RewriteRule !^{username}.tgz|index.cgi|,RewriteRule !^index.cgi|," {html_var}/.htaccess""")
+                    agent.whm_exec(server_id, f"rm -f {html_var}/{username}.tgz")
+                    gateway_session.run_cmd(f"rm -f {username}.tgz")
+                else:
+                    print("Issue: Not enough space on /var to hold the tar file")
+                    print("Migrate this manually to the legal server.")
+                    print("https://confluence.endurance.com/pages/viewpage.action?pageId=111327316")
+                    print("Legal Dir: {}".format(legal_dir))
+                    print()
+                    userConfirm("Waiting for manual migration..")
         
         print("Finished migrating the data.")
         print("Updating group to 'wheel' recursively..")
