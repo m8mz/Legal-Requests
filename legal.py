@@ -4,19 +4,19 @@ from Agent import Agent
 import argparse
 import sys
 import string
-from jumpssh import SSHSession
+from jumpssh import SSHSession, exception
 from datetime import datetime
 import re
 import time
 
 
 def convertToGigs(x):
+    num = float("".join(c for c in x if c in string.digits))
     if 'T' in x:
-        x = "".join(c for c in x if c in string.digits)
-        x = int(avail + "000")
-    else:
-        x = int(float(x.replace('G', '')))
-    return x
+        num = num * 1000
+    elif 'M' in x:
+        num = num * .001
+    return num
 
 
 def userConfirm(msg="Please do so manually.."):
@@ -80,8 +80,8 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
 
     if server_id and username and custbox and custhome:
 
-        cust_disk_size = int(re.match(r'^(\d+)', agent.whm_exec(server_id, "du -sh {}".format(custhome),
-                                                                output=True)).group(1))
+        cust_disk_size = convertToGigs(agent.whm_exec(server_id, "du -sh {} | awk '{{print $1}}".format(custhome),
+                                                                output=True))
         overall_size_est = cust_disk_size * 4
         disk_results = agent.whm_exec(server_id, "df -h | awk '$6 ~ /home/{print $6\":\"$5\":\"$4}'",
                                       output=True).split('\n')
@@ -140,14 +140,7 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         
         grablogs_exist = 'if [[ -f "/usr/sec/bin/grablogs" ]]; then echo True; else echo False; fi'
         if agent.whm_exec(server_id, grablogs_exist, output=True):
-            domains_list = "--domains={}".format(" --domains=".join(domains))
-            command = f"/usr/sec/bin/grablogs --tarfile={tarfile} --cususer={username} {domains_list}"
-            agent.whm_exec(server_id, command)
-            if bluerock:
-                agent.whm_exec(server_id, f"rsync -x -a /home/apachelogs/{username}/ {box_dir}/logs/")
-                agent.whm_exec(server_id, f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{args.domain}* {box_dir}/logs/")
-            else:
-                agent.whm_exec(server_id, f"rsync -x -a {custhome}/logs {box_dir}/")
+            pass
         else:
             print("Installing grablogs to server..")
             agent.whm_exec(server_id, "mkdir -p /usr/sec/bin/")
@@ -156,6 +149,15 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
             else:
                 agent.whm_exec(server_id, "wget -O /usr/sec/bin/grablogs https://raw.githubusercontent.com/marcushg36/Legal-Requests/master/grablogs.pl && chmod 700 /usr/sec/bin/grablogs")
             print("Done.")
+
+        domains_list = "--domains={}".format(" --domains=".join(domains))
+        command = f"/usr/sec/bin/grablogs --tarfile={tarfile} --cususer={username} {domains_list}"
+        agent.whm_exec(server_id, command)
+        if bluerock:
+            agent.whm_exec(server_id, f"rsync -x -a /home/apachelogs/{username}/ {box_dir}/logs/")
+            agent.whm_exec(server_id, f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{args.domain}* {box_dir}/logs/")
+        else:
+            agent.whm_exec(server_id, f"rsync -x -a {custhome}/logs {box_dir}/")
         
         if not args.logs:
             print("Processing request for full preservation and logs.. please wait.")
@@ -226,34 +228,25 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
                 agent.whm_exec(server_id, f"cd {box_dir} && tar -caf {html_var}/{username}.tgz *")
                 while True:
                     print('.', end='', flush=True)
-                    tar_pid = agent.whm_exec(server_id, f"ps faux | grep '{username}.tgz' | awk '{{print $2}}'",
+                    tar_pid = agent.whm_exec(server_id, f"ps faux | grep '{username}.tgz' | grep -v grep | awk '{{print $2}}'",
                                              output=True)
                     if not tar_pid:
                         break
+                    time.sleep(10)
                 print('Done.')
-                if agent.whm_exec(server_id, f"sed -i 's,RewriteRule !^index.cgi|,RewriteRule !^{username}.tgz|index.cgi|,' {html_var}/.htaccess"):
-                    pass
-                else:
-                    print(f"Issue updating {html_var}/.htaccess to allow the compressed file '{html_var}/{username}.tgz' in the RewriteRule.")
-                    userConfirm()
+                agent.whm_exec(server_id, f"""sed -i "s,RewriteRule !^index.cgi|,RewriteRule !^{username}.tgz|index.cgi|," {html_var}/.htaccess""")
                 print("Data currently being migrated..")
-                gateway_session.run_cmd(f"wget {custbox_addr}/{username}.tgz")
+                try:
+                    gateway_session.run_cmd(f"wget {custbox_addr}/{username}.tgz")
+                except exception.RunCmdError:
+                    print(f"Issue updating {html_var}/.htaccess to allow the compressed file '{html_var}/{username}.tgz' in the RewriteRule.")
+                    sys.exit()
                 gateway_session.run_cmd(f"scp {username}.tgz {legal_addr}:{legal_dir}/")
                 legal_session.run_cmd(f"cd {legal_dir} && tar -xf {username}.tgz")
-                print("Done.")
                 print("Cleaning up bluerock migration..")
-                if agent.whm_exec(server_id, f"sed -i 's,RewriteRule !^{username}.tgz|index.cgi|,RewriteRule !^index.cgi|,' {html_var}/.htaccess"):
-                    pass
-                else:
-                    print("Issue reverting changes to {html_var}/.htaccess")
-                    userConfirm()
-                if agent.whm_exec(server_id, f"rm -f {html_var}/{username}.tgz"):
-                    pass
-                else:
-                    print("Issue removing {html_var}/{username}.tgz")
-                    userConfirm()
+                agent.whm_exec(server_id, f"""sed -i "s,RewriteRule !^{username}.tgz|index.cgi|,RewriteRule !^index.cgi|," {html_var}/.htaccess""")
+                agent.whm_exec(server_id, f"rm -f {html_var}/{username}.tgz")
                 gateway_session.run_cmd(f"rm -f {username}.tgz")
-                print("Done.")
             else:
                 print("Issue: Not enough space on /var to hold the tar file")
                 print("Migrate this manually to the legal server.")
@@ -267,7 +260,6 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         legal_session.run_cmd(f"chgrp -R wheel {legal_dir}/*")
         print("Calculating size..")
         legal_size = legal_session.run_cmd(f"du -sh {legal_dir}").output.split('\t')[0]
-        print("Done.")
         print(f"Cleaning up data on customer's box '{box_dir}'..")
         agent.whm_exec(server_id, f"rm -rf {box_dir}/*")
         print("Done.")
