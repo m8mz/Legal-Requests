@@ -144,7 +144,8 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
             command = f"/usr/sec/bin/grablogs --tarfile={tarfile} --cususer={username} {domains_list}"
             agent.whm_exec(server_id, command)
             if bluerock:
-                agent.whm_exec(server_id, f"rsync -x -rlptgo /home/apachelogs/{username}/ {box_dir}/apachelogs/")
+                agent.whm_exec(server_id, f"rsync -x -a /home/apachelogs/{username}/ {box_dir}/logs/")
+                agent.whm_exec(server_id, f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{args.domain}* {box_dir}/logs/")
             else:
                 agent.whm_exec(server_id, f"rsync -x -a {custhome}/logs {box_dir}/")
         else:
