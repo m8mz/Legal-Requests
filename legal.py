@@ -1,4 +1,14 @@
 #!/usr/bin/env python3.7
+"""
+    Description:
+    This script will capture the account data and migrate to the legal server.
+    This will work for legacy/bluerock accounts and will perform a divided
+    migration if needed. Also, takes care of everything from start to finish to
+    the legal server. Including installing the grablogs script, updating perms,
+    and cleaning up the data.
+    
+    Author: Marcus Hancock-Gaillard
+"""
 
 from Agent import Agent
 import argparse
@@ -28,7 +38,7 @@ def userConfirm(msg="Please do so manually.."):
         sys.exit()
         
         
-def waitingForProcesses(command_check):
+def waitingForProcesses(command_check, out=True):
     global server_id
     counter = 0
     while True:
@@ -45,7 +55,8 @@ def waitingForProcesses(command_check):
             time.sleep(60)
         else:
             time.sleep(90)
-    print("Done.")
+    if out:
+        print("Done.")
 
 
 DIVIDE_MIGRATION = False
@@ -54,8 +65,10 @@ agent = Agent()
 
 legal_addr = '10.0.82.205'
 gateway_session = SSHSession('zugzug2.bluehost.com', port=5190, username=agent.username)
+gateway_size = gateway_session.run_cmd("df -h | awk '$6 ~ /^\/$/{print $4}'").output
+gateway_size = convertToGigs(gateway_size)
 legal_session = gateway_session.get_remote_session(legal_addr)
-legal2_size = legal_session.run_cmd("df -h | awk '$6 ~ /legal2/{print $4}'").output.split('\t')[0]
+legal2_size = legal_session.run_cmd("df -h | awk '$6 ~ /legal2/{print $4}'").output
 legal2_size = convertToGigs(legal2_size)
 
 parser = argparse.ArgumentParser()
@@ -90,6 +103,8 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
                                       "INNER JOIN cpanel ON cpanel.username = '{}' "
                                       "WHERE domain.account_id = '{}'").format(username, custid))[1]
     domains = [domain.get('domain') for domain in domains_query]
+    main_domain = agent.whm_exec(server_id, f"grep '{username}' /etc/trueuserdomains | cut -d: -f1",
+                                 output=True)
     today_date = datetime.now().strftime("%Y-%m-%d")
     custbox = agent.hal_request(action="server_info", id=server_id).get('hostname')
     custhome = agent.whm_exec(server_id,
@@ -98,7 +113,7 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
     custnum = re.match(r'/home(\d+)/', custhome).group(1)
     custbox_addr = agent.whm_exec(server_id, "hostname -i", output=True)
     html_var = "/var/www/html" # for bluerock
-    legal_dir = "/legal2/{}/{}".format(args.domain, today_date)
+    legal_dir = "/legal2/{}/{}".format(main_domain, today_date)
     legal_session.run_cmd(f"mkdir -p {legal_dir}")
     query = (
     "SELECT customer_meta_name.name FROM domain "
@@ -107,7 +122,7 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
     "INNER JOIN customer_meta_name ON customer_meta.name_id = customer_meta_name.id "
     "WHERE domain = '{}' "
     "AND customer_meta_name.name = 'bluerock'"
-    ).format(args.domain)
+    ).format(main_domain)
     bluerock = agent.db_request(query)
 
     if server_id and username and custbox and custhome:
@@ -131,9 +146,8 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         try:
             home_disk
         except NameError:
-            if not args.logs and not bluerock:
-                #TODO: Do the preservation in sections
-                print("Err: No home disk that can support ~{}G".format(overall_size_est))
+            if not args.logs:
+                print("Issue: No home disk that can support ~{}G".format(overall_size_est))
                 usable_disks = [disk[0] for disk in home_disks if disk[2] > cust_disk_size + 5]
                 if usable_disks:
                     print("Going to migrate the data separately. Will take longer..")
@@ -141,6 +155,7 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
                     home_disk = usable_disks[0]
                     DIVIDE_MIGRATION = True
                 else:
+                    print("Exiting...")
                     sys.exit()
             else:
                 home_disk = home_disks[0][0]
@@ -151,13 +166,18 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
             print("Err: Not enough space available on the legal server '/legal2' need ~{}".format(overall_size_est))
             print("Exiting..")
             sys.exit()
+            
+        if bluerock and overall_size_est > gateway_size:
+            print("Err: Not enough space available on the zugzug2 server '/' need ~{}".format(overall_size_est))
+            print("Exiting..")
+            sys.exit()
 
         print("Initiating Legal Request...")
         print()
         print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         print("Hostname: {}".format(custbox))
         print("User: {}".format(username))
-        print("Main Domain: {}".format(args.domain)) #TODO: grab main domain if addon domain used
+        print("Main Domain: {}".format(main_domain))
         print("Requested Domain: {}".format(args.domain))
         print()
 
@@ -173,7 +193,7 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
                 f"rsync -x -rlptgo /backup{custnum}/cpbackup/monthly/{username}/ {box_dir}/{username}.monthly/"
         ]
         waiting_queue_names = [
-                "non-home-data",
+                "non-home-data & logs",
                 f"{username}.home",
                 f"{username}.seed",
                 f"{username}.daily",
@@ -191,7 +211,10 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
             pass
         else:
             print("Installing grablogs to server..")
-            agent.whm_exec(server_id, "mkdir -p /usr/sec/bin/")
+            agent.whm_exec(server_id, "mkdir -p /usr/sec/bin/ /usr/sec/lib/")
+            secbinlog_exist = 'if [[ -f "/usr/sec/lib/SecBinLog.pm" ]]; then echo True; else echo False; fi'
+            if not agent.whm_exec(server_id, grablogs_exist, output=True):
+                agent.whm_exec(server_id, "wget -O /usr/sec/lib/SecBinLog.pm https://raw.githubusercontent.com/marcushg36/Legal-Requests/master/SecBinLog.pm && chmod 644 /usr/sec/lib/SecBinLog.pm")
             if bluerock:
                 agent.whm_exec(server_id, "wget -O /usr/sec/bin/grablogs https://raw.githubusercontent.com/marcushg36/Legal-Requests/master/grablogs_bluerock.pl && chmod 700 /usr/sec/bin/grablogs")
             else:
@@ -217,10 +240,10 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         if bluerock:
             if args.logs:
                 agent.whm_exec(server_id, f"rsync -x -a /home/apachelogs/{username}/ {box_dir}/logs/")
-                agent.whm_exec(server_id, f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{args.domain}* {box_dir}/logs/")
+                agent.whm_exec(server_id, f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{main_domain}* {box_dir}/logs/")
             else:
                 waiting_queue.append(f"rsync -x -a /home/apachelogs/{username}/ {box_dir}/logs/")
-                waiting_queue.append(f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{args.domain}* {box_dir}/logs/")
+                waiting_queue.append(f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{main_domain}* {box_dir}/logs/")
         else:
             if args.logs:
                 agent.whm_exec(server_id, f"rsync -x -a {custhome}/logs {box_dir}/")
@@ -257,17 +280,9 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
                                                                    output=True))
                     if custbox_var_size > custbox_sd_size:
                         print("Creating compressed file for transfer..")
-                        html_var = "/var/www/html"
                         agent.whm_exec(server_id, f"cd {box_dir} && tar -caf {html_var}/{username}.tgz *")
-                        while True:
-                            print('.', end='', flush=True)
-                            tar_pid = agent.whm_exec(server_id, f"ps faux | grep '{username}.tgz' | grep -v grep | awk '{{print $2}}'",
-                                                     output=True)
-                            if not tar_pid:
-                                break
-                            time.sleep(10)
-                        print('Done.')
-                        agent.whm_exec(server_id, f"""sed -i "s,RewriteRule !^index.cgi|,RewriteRule !^{username}.tgz|index.cgi|," {html_var}/.htaccess""")
+                        waitingForProcesses(f"ps faux | grep '{username}.tgz' | grep -v grep | awk '{{print $2}}'")
+                        agent.whm_exec(server_id, f"""sed -i "s/RewriteRule !^index.cgi|/RewriteRule !^{username}.tgz|index.cgi|/" {html_var}/.htaccess""")
                         print("Data currently being migrated..")
                         try:
                             gateway_session.run_cmd(f"wget {custbox_addr}/{username}.tgz")
@@ -277,7 +292,7 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
                         gateway_session.run_cmd(f"scp {username}.tgz {legal_addr}:{legal_dir}/")
                         legal_session.run_cmd(f"cd {legal_dir} && tar -xf {username}.tgz")
                         print("Cleaning up bluerock migration..")
-                        agent.whm_exec(server_id, f"""sed -i "s,RewriteRule !^{username}.tgz|index.cgi|,RewriteRule !^index.cgi|," {html_var}/.htaccess""")
+                        agent.whm_exec(server_id, f"""sed -i "s/RewriteRule !^{username}.tgz|index.cgi|/RewriteRule !^index.cgi|/" {html_var}/.htaccess""")
                         agent.whm_exec(server_id, f"rm -f {html_var}/{username}.tgz")
                         gateway_session.run_cmd(f"rm -f {username}.tgz")
                     else:
@@ -288,44 +303,106 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
                         print()
                         userConfirm("Waiting for manual migration..")
             elif DIVIDE_MIGRATION and bluerock:
-                print("Grabbing logs..")
-                agent.whm_exec(server_id, f"rsync -x -a /home/apachelogs/{username}/ {box_dir}/logs/")
-                agent.whm_exec(server_id, f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{args.domain}* {box_dir}/logs/")
-                agent.whm_exec(server_id, f"/scripts/pkgacct --skiphomedir --skiplogs {username} {box_dir}/non-home-data 2>&1")
-                waitingForProcesses("ps faux | grep " + username + "| awk '/" + box_dir.replace('/','\/') + "/{print $2}'")
-                bluerock_waiting_queue = [
-                        f"cd {box_dir} && tar -cf {html_var}/{username}.tar non-home-data/ logs/ {tarfile}",
-                        f"cd {custhome}/.. && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.home/ {username}/",
-                        f"cd /backup{custnum}/cpbackup/seed/ && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.seed/ {username}/",
-                        f"cd /backup{custnum}/cpbackup/daily/ && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.daily/ {username}/",
-                        f"cd /backup{custnum}/cpbackup/weekly/ && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.weekly/ {username}/",
-                        f"cd /backup{custnum}/cpbackup/monthly/ && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.monthly/ {username}/",
-                ]
+                custbox_var = agent.whm_exec(server_id, "df -h | awk '$6 ~ /var$/{print $6\":\"$5\":\"$4}'",
+                                                 output=True)
+                custbox_var_size = custbox_var.split(':')[2]
+                custbox_var_size = convertToGigs(custbox_var_size)
+                if custbox_var_size > overall_size_est:
+                    print("Grabbing user data and logs..", end='', flush=True)
+                    agent.whm_exec(server_id, f"rsync -x -a /home/apachelogs/{username}/ {box_dir}/logs/")
+                    agent.whm_exec(server_id, f"rsync -x -a /usr/local/apache/logs/domlogs/ftp.{main_domain}* {box_dir}/logs/")
+                    agent.whm_exec(server_id, f"/scripts/pkgacct --skiphomedir --skiplogs {username} {box_dir}/non-home-data 2>&1")
+                    time.sleep(3)
+                    waitingForProcesses("ps faux | grep " + username + "| awk '/" + box_dir.replace('/','\/') + "/{print $2}'")
+                    for item in cleanup_queue:
+                        agent.whm_exec(server_id, item)
+                    time.sleep(1)
+                    waitingForProcesses("ps faux | grep " + username + "| awk '/" + box_dir.replace('/','\/') + "/{print $2}'", out=False)
+                    bluerock_waiting_queue = [
+                            f"cd {box_dir} && tar -cf {html_var}/{username}.tar non-home-data/ logs/ {tarfile}",
+                            f"cd {custhome}/.. && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.home/ {username}/",
+                            f"cd /backup{custnum}/cpbackup/seed/ && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.seed/ {username}/",
+                            f"cd /backup{custnum}/cpbackup/daily/ && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.daily/ {username}/",
+                            f"cd /backup{custnum}/cpbackup/weekly/ && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.weekly/ {username}/",
+                            f"cd /backup{custnum}/cpbackup/monthly/ && tar -rf {html_var}/{username}.tar --transform s/^{username}/{username}.monthly/ {username}/",
+                    ]
+                    print("Creating compressed file for transfer..")
+                    for name, item in zip(waiting_queue_names, bluerock_waiting_queue):
+                        print("Archiving {}..".format(name), end='', flush=True)
+                        agent.whm_exec(server_id, item)
+                        time.sleep(3)
+                        waitingForProcesses(f"ps faux | grep '{username}.tar' | grep -v grep | awk '{{print $2}}'")
+                    print("Compressing..", end='', flush=True)
+                    agent.whm_exec(server_id, f"gzip /var/www/html/{username}.tar")
+                    waitingForProcesses(f"ps faux | grep '{username}.tar' | grep -v grep | awk '{{print $2}}'")
+                    print("Migrating data...")
+                    agent.whm_exec(server_id, f"""sed -i "s/RewriteRule !^index.cgi|/RewriteRule !^{username}.tar.gz|index.cgi|/" {html_var}/.htaccess""")
+                    print("Data currently being migrated..")
+                    try:
+                        gateway_session.run_cmd(f"wget {custbox_addr}/{username}.tar.gz",
+                                                retry=3,
+                                                retry_interval=3)
+                    except exception.RunCmdError:
+                        print(f"Issue updating {html_var}/.htaccess to allow the compressed file '{html_var}/{username}.tar.gz' in the RewriteRule.")
+                        sys.exit()
+                    gateway_session.run_cmd(f"scp {username}.tar.gz {legal_addr}:{legal_dir}/",
+                                            retry=3,
+                                            retry_interval=3)
+                    legal_session.run_cmd(f"cd {legal_dir} && tar -xf {username}.tar.gz",
+                                          retry=3,
+                                          retry_interval=3)
+                    print("Cleaning up bluerock migration..")
+                    agent.whm_exec(server_id, f"""sed -i "s/RewriteRule !^{username}.tar.gz|index.cgi|/RewriteRule !^index.cgi|/" {html_var}/.htaccess""")
+                    agent.whm_exec(server_id, f"rm -f {html_var}/{username}.tar.gz")
+                    gateway_session.run_cmd(f"rm -f {username}.tar.gz",
+                                            retry=3,
+                                            retry_interval=3)
+                else:
+                    print("Issue: Not enough space on /var to hold the tar file")
+                    print("Migrate this manually to the legal server.")
+                    print("https://confluence.endurance.com/pages/viewpage.action?pageId=111327316")
+                    print("Legal Dir: {}".format(legal_dir))
+                    print()
+                    userConfirm("Waiting for manual migration..")
+                
             elif DIVIDE_MIGRATION and not bluerock:
                 for name, item in zip(waiting_queue_names, waiting_queue):
-                    print("{}.".format(name), end='', flush=True)
+                    print("{}..".format(name), end='', flush=True)
                     agent.whm_exec(server_id, item)
                     time.sleep(3)
                     waitingForProcesses("ps faux | grep " + username + "| awk '/" + box_dir.replace('/','\/') + "/{print $2}'")
                     print("Fixing permissions and ownership of data..")
                     for item in cleanup_queue:
                         agent.whm_exec(server_id, item)
+                    time.sleep(1)
                     waitingForProcesses("ps faux | grep " + username + "| awk '/" + box_dir.replace('/','\/') + "/{print $2}'")
                     print("Migrating {}...".format(name))
-                    legal_session.run_cmd(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -rlptgoH {custbox}:{box_dir}/* {legal_dir}/ 2> ./rsync-err.log")
+                    legal_session.run_cmd(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -rlptgoH {custbox}:{box_dir}/* {legal_dir}/ 2>> ./rsync-err.log",
+                                          retry=3,
+                                          retry_interval=3)
                     agent.whm_exec(server_id, f"rm -rf {box_dir}/*", output=True)
-                    print("Done.")
+                print("Done.")
             
             print("Synchronizing seed..")
-            legal_session.run_cmd(f"rsync -a {username}.seed/homedir/ {username}.home/")
-            legal_session.run_cmd(f"rsync -a {username}.home/ {username}.seed/homedir/")
-            legal_session.run_cmd(f"rsync -a {username}.daily/ {username}.seed/")
-            legal_session.run_cmd(f"rsync -a {username}.weekly/ {username}.seed/")
-            legal_session.run_cmd(f"rsync -a {username}.monthly/ {username}.seed/")
+            legal_session.run_cmd(f"rsync -a {legal_dir}/{username}.seed/homedir/ {legal_dir}/{username}.home/",
+                                  retry=3,
+                                  retry_interval=3)
+            legal_session.run_cmd(f"rsync -a {legal_dir}/{username}.home/ {legal_dir}/{username}.seed/homedir/",
+                                  retry=3,
+                                  retry_interval=3)
+            legal_session.run_cmd(f"rsync -a {legal_dir}/{username}.daily/ {legal_dir}/{username}.seed/",
+                                  retry=3,
+                                  retry_interval=3)
+            legal_session.run_cmd(f"rsync -a {legal_dir}/{username}.weekly/ {legal_dir}/{username}.seed/",
+                                  retry=3,
+                                  retry_interval=3)
+            legal_session.run_cmd(f"rsync -a {legal_dir}/{username}.monthly/ {legal_dir}/{username}.seed/",
+                                  retry=3,
+                                  retry_interval=3)
         
         print("Finished migrating the data.")
         print("Updating group to 'wheel' recursively..")
-        legal_session.run_cmd(f"chgrp -R wheel {legal_dir}/*")
+        legal_session.run_cmd(f"chown -R mhancock-gaillard:wheel {legal_dir}/*")
         print("Calculating size..")
         legal_size = legal_session.run_cmd(f"du -sh {legal_dir}").output.split('\t')[0]
         print(f"Cleaning up data on customer's box '{box_dir}'..")
@@ -337,8 +414,9 @@ if len(res[1]) == 1 and res[1][0].get('hal_account_id'):
         print()
 
     else:
-        print("No server id/username was found from the account information in HAL. Exiting...")
-        sys.exit()    
+        print("No server id/username was found from the account information in HAL")
+        print("or the user does not exist on the box. Exiting...")
+        sys.exit()
 
 else:
     if len(res[1]) > 1:
