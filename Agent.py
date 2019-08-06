@@ -31,7 +31,7 @@ class Agent_Error(Exception):
 class Agent:
     """
         The Agent class is responsible for logging in, creating the cookie session,
-        and for sending/receiving hal api calls.
+        and for sending/receiving hal api calls. Also, can make calls to the CPM and DB.
     """
 
     # Class Variables
